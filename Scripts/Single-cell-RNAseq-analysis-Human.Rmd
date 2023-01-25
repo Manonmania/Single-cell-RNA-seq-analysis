@@ -1,0 +1,463 @@
+---
+title: "Single Cell RNA-seq Data Analysis"
+output:
+  html_document:
+    theme: united
+  pdf_document: default
+date: 'Compiled: `r format(Sys.Date(), "%B %d, %Y")`'
+---
+***
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  cache = TRUE,
+  cache.lazy = FALSE,
+  tidy = TRUE,
+  echo = FALSE,
+  warning = FALSE
+)
+```
+
+### Setup the Seurat Object
+
+
+```{r init, message=FALSE, echo=FALSE}
+library(dplyr)
+library(Seurat)
+library(sctransform)
+library(clustree)
+library(BiocParallel)
+#library(ggdendro)
+#library(parallel)
+library(fgsea)
+library(ggrepel)
+library(scales)
+library(SingleR)
+library(msigdbr)
+library(openxlsx)
+library(stats)
+library(pheatmap)
+#library(future)
+library(stringr)
+library(SeuratDisk)
+
+# Based on code from http://michaeljw.com/blog/post/subchunkify/
+
+#' Generate a sub-chunk to be interpreted by knitr.  The enclosing chunk
+#' must have "results='asis'"
+#'
+#' @param g The output to chunkify (only tested with figures to date)
+#' @param ... Additional named arguments to the chunk
+#' @return NULL
+#' @details The chunk is automatically output to the console.  There is
+#'   no need to print/cat its result.
+#' @export
+subchunkify <- local({
+ chunk_count <- 0
+ function(g, ...) {
+   chunk_count <<- chunk_count + 1
+   g_deparsed <-
+     paste0(deparse(
+       function() {g}
+     ),
+     collapse = '')
+   args <- list(...)
+   args <-
+     lapply(names(args),
+            FUN=function(nm, arglist) {
+              current <- arglist[[nm]]
+              if (length(current) > 1) {
+                stop("Only scalars are supported by subchunkify")
+              } else if (is.character(current) | is.factor(current)) {
+                current <- as.character(current)
+                ret <- paste0('"', gsub('"', '\"', current, fixed=TRUE), '"')
+              } else if (is.numeric(current) | is.logical(current)) {
+                ret <- as.character(current)
+              } else {
+                stop("Unhandled class in subchunkify argument handling")
+              }
+              paste0(nm, "=", ret)
+            },
+            arglist=args)
+   args <- paste0(unlist(args), collapse=", ")
+   chunk_header <-
+     paste(
+       paste0("{r sub_chunk_", chunk_count),
+       if (nchar(args) > 0) {
+         paste(",", args)
+       } else {
+         NULL
+       },
+       ", echo=FALSE}")
+   
+   sub_chunk <- paste0(
+     "\n```",chunk_header, "\n",
+     "(", 
+     g_deparsed
+     , ")()\n",
+     "```\n")
+   cat(knitr::knit(text = knitr::knit_expand(text = sub_chunk), quiet = TRUE))
+ }
+})
+
+sigmoid = function(x) {
+   1 / (1 + exp(-x))
+}
+```
+
+#Load and merge data
+
+```{r Load In Data}
+# Load the datasets
+
+setwd("/Users/mano/Documents/scRNA-processing/")
+
+sample.dirs <- list.files("/Users/mano/Documents/scRNA-processing/Data", full.names = T)
+
+# Convert H5AD (Output from scrublet) to H5Seurat
+
+#for (i in sample.dirs){
+#  input_path <- paste0(i, "/", basename(i), ".h5ad")
+#  output_path <- paste0(i, "/", basename(i), ".h5seurat")
+#  Convert(input_path, 
+#          output_path)
+#}
+
+# Load H5Seurat
+
+sample.ids <- paste0(sample.dirs,"/",basename(sample.dirs),".h5seurat")
+individual_sample <- lapply(setNames(sample.ids,basename(sample.dirs)), 
+                            function(x) LoadH5Seurat(x))
+# Considering only singlet cells
+
+singlets <- lapply(individual_sample, 
+          function(x) subset(x, predicted_doublets == 'singlet'))
+
+for (i in names(singlets)){
+  singlets[[i]]@meta.data$orig.ident <- i
+}
+
+# Create merged Seurat obj
+seurat_object <- merge(x = singlets[[1]], y = singlets[2:6])
+
+
+```
+
+#QC Data
+
+```{r qc, results='hide', fig.height=7,fig.width=13}
+
+Idents(seurat_object) <- seurat_object$orig.ident
+
+### If human samples, use the patter "^MT-" and if mouse samples use pattern "^mt-"
+mito.features <- grep(pattern = "^MT-", x = rownames(x = seurat_object), value = TRUE)
+percent.mito <- Matrix::colSums(x = GetAssayData(object = seurat_object, slot = 'counts')[mito.features, ]) / Matrix::colSums(x = GetAssayData(object = seurat_object, slot = 'counts'))
+
+# The [[ operator can add columns to object metadata, and is a great place to stash QC stats
+seurat_object[['percent.mito']] <- percent.mito
+VlnPlot(object = seurat_object, features = c("nFeature_RNA", "n_counts", "percent.mito"), ncol = 3)
+
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used for anything 
+# calculated by the object, i.e. columns in object metadata, PC scores etc.
+# Since there is a rare subset of cells with an outlier level of high mitochondrial percentage
+# and also low UMI content, we filter these as well
+FeatureScatter(object = seurat_object, feature1 = "n_counts", feature2 = "percent.mito")
+
+FeatureScatter(object = seurat_object, feature1 = "n_counts", feature2 = "nFeature_RNA")
+
+FeatureScatter(object = seurat_object, feature1 = "nFeature_RNA", feature2 = "percent.mito")
+
+```
+
+# Filtering process
+
+```{r filtering, results='hide', fig.height=7,fig.width=13}
+
+# Try filtering cells with high mitochondrial content, extremely high or low UMI, and high unique gene counts (in this project I am not filtering high gene counts)
+seurat_objectfiltered <- subset(x = seurat_object, subset = n_counts > 750 & n_counts <25000 & nFeature_RNA > 300 & nFeature_RNA < 10000 & percent.mito < 0.25)
+
+VlnPlot(object = seurat_objectfiltered, features = c("nFeature_RNA", "n_counts", "percent.mito"), ncol = 3)
+#VlnPlot(object = seurat_objectfiltered, features = c("nFeature_RNA", "n_counts", "percent.mito"), ncol = 3, pt.size = 0)
+#FeatureScatter(object = seurat_objectfiltered, feature1 = "n_counts", feature2 = "percent.mito")
+#FeatureScatter(object = seurat_objectfiltered, feature1 = "nFeature_RNA", feature2 = "percent.mito")
+#FeatureScatter(object = seurat_objectfiltered, feature1 = "n_counts", feature2 = "nFeature_RNA")
+
+saveRDS(seurat_objectfiltered,"Projectname_doublets.rds")
+```
+
+#Normalization
+
+```{r normalize, results='hide',  warnings=FALSE, eval=TRUE}
+#seurat_object <- PercentageFeatureSet(seurat_object, pattern = "^MT-", col.name = "percent.mt")
+seurat_objectfiltered <- PercentageFeatureSet(seurat_objectfiltered, pattern = "^MT-", col.name = "percent.mt")
+
+# run sctransform, in this project's case do not regress mito content. New standard parameter, include all genes for downstream analysis, not just top 3k. More computationally intense but more sensible
+
+#seurat_object <- SCTransform(seurat_object, verbose = FALSE, variable.features.n = 6000, vars.to.regress =  "percent.mito")
+seurat_objectfiltered <- SCTransform(seurat_objectfiltered, vars.to.regress =  "percent.mito")
+
+#seurat_objectfiltered <- NormalizeData(seurat_objectfiltered, verbose = FALSE)
+#seurat_objectfiltered <- FindVariableFeatures(seurat_objectfiltered,
+#                              selection.method = "vst", nfeatures = 6000)
+#seurat_objectfiltered <- ScaleData(seurat_objectfiltered ,verbose = FALSE)
+
+#seurat_objectfiltered <- RunPCA(seurat_objectfiltered ,
+ #                         pc.genes = seurat_objectfiltered@var.genes, npcs = 30, verbose = FALSE)
+
+#ElbowPlot(seurat_objectfiltered)
+
+#seurat_objectfiltered <- FindNeighbors(object = seurat_objectfiltered, dims = 1:20)
+#seurat_objectfiltered <- FindClusters(object = seurat_objectfiltered, resolution = 0.5)
+#seurat_objectfiltered <- RunUMAP(object = seurat_objectfiltered, dims = 1:20)
+
+```
+
+#Run PCA
+
+```{r pca,  warnings=FALSE, eval=TRUE}
+
+#seurat_objectfiltered <- readRDS("seurat_objectfiltered_sctransformed.rds")
+
+#seurat_object <- RunPCA(object = seurat_object, features = VariableFeatures(object = seurat_object), verbose = FALSE)
+seurat_objectfiltered <- RunPCA(object = seurat_objectfiltered, features = VariableFeatures(object = seurat_objectfiltered), verbose = FALSE)
+
+```
+
+
+```{r elbow_plot, fig.height=6, fig.width=10, warning=FALSE, eval=TRUE}
+
+#ElbowPlot(object = seurat_object, ndims = 50)
+ElbowPlot(object = seurat_objectfiltered, ndims = 50)
+```
+
+
+```{r cluster}
+seurat_objectfiltered <- FindNeighbors(object = seurat_objectfiltered, dims = 1:10)
+seurat_objectfiltered <- FindClusters(object = seurat_objectfiltered, resolution = 0.2)
+seurat_objectfiltered <- RunUMAP(object = seurat_objectfiltered, dims = 1:10)
+
+```
+
+
+```{r Setup set information}
+
+Idents(seurat_objectfiltered) <- seurat_objectfiltered$orig.ident
+
+cells.use <- WhichCells(seurat_objectfiltered, idents = 
+                          c("298_KPC_Pancreas"))
+seurat_objectfiltered <- SetIdent(seurat_objectfiltered, cells = cells.use, value = 'Set1')
+
+cells.use <- WhichCells(seurat_objectfiltered, idents = 
+                          c("146_KPC_Pancreas"))
+seurat_objectfiltered <- SetIdent(seurat_objectfiltered, cells = cells.use, value = 'Set2')
+
+cells.use <- WhichCells(seurat_objectfiltered, idents = 
+                        c("KPC_LUC_Liver_221"))
+seurat_objectfiltered <- SetIdent(seurat_objectfiltered, cells = cells.use, value = 'Set3')
+
+cells.use <- WhichCells(seurat_objectfiltered, idents = 
+                        c("208_KPC_Pancreas","KPC_LUC_Liver_249","KPC_LUC_Liver_259"))
+seurat_objectfiltered <- SetIdent(seurat_objectfiltered, cells = cells.use, value = 'Set4')
+
+seurat_objectfiltered$Set <- Idents(seurat_objectfiltered)
+
+
+```
+
+
+```{r DimPlot}
+
+Idents(seurat_objectfiltered) <- seurat_objectfiltered$seurat_clusters
+
+DimPlot(seurat_objectfiltered, reduction = "umap", split.by="Set",
+        raster = FALSE, label=TRUE)
+
+Idents(seurat_objectfiltered) <- seurat_objectfiltered$orig.ident
+
+DimPlot(seurat_objectfiltered, reduction = "umap",raster = FALSE, split.by="orig.ident") +
+  ggtitle("Tumor disassocation - Dim10")
+
+```
+
+
+```{r Batch correction}
+
+seurat_objectfiltered <- readRDS("Tumor_disassociate_sctransformed_before_batchcorrection.rds")
+
+library(harmony)
+library(cowplot)
+seurat_objectfiltered <- seurat_objectfiltered %>% 
+  RunHarmony("Set", plot_convergence = TRUE, project.dim = F)
+
+harmony_embeddings <- Embeddings(seurat_objectfiltered, 'harmony')
+harmony_embeddings[1:5, 1:5]
+
+seurat_objectfiltered <- seurat_objectfiltered %>% 
+  RunUMAP(reduction = "harmony", dims = 1:10) %>% 
+  FindNeighbors(reduction = "harmony", dims = 1:10) %>% 
+  FindClusters(resolution = 0.2) %>% 
+  identity()
+
+DimPlot(seurat_objectfiltered, reduction = "umap", split.by = 'Set', 
+        raster = FALSE, label=TRUE)
+
+DimPlot(seurat_objectfiltered, reduction = "umap", label = TRUE, raster = FALSE) +
+  ggtitle("Tumor disassociation - dim20")
+
+```
+
+# Cell Annotation
+
+```{r SingleR Annotation}
+
+library(SingleR)
+
+seurat_objectfiltered_diet <- DietSeurat(seurat_objectfiltered, graphs = "pca")
+
+single.sce <- as.SingleCellExperiment(seurat_objectfiltered_diet)
+
+#Test both references individually
+ref.blueprint = BlueprintEncodeData(ensembl=FALSE)
+pred.test <- SingleR(test = single.sce, ref = ref.blueprint, labels = ref.blueprint$label.main)
+
+seurat_objectfiltered[["BlueprintEncodeData"]] <- pred.test$labels
+
+saveRDS(seurat_objectfiltered,"Tumor_disassociate_sctransformed_celltype.rds")
+
+```
+
+```{R Sample Treatment vs Control information}
+
+seurat_objectfiltered <- readRDS("Tumor_disassociate_sctransformed_celltype.rds")
+
+Idents(seurat_objectfiltered) <- seurat_objectfiltered$orig.ident
+
+cells.use <- WhichCells(seurat_objectfiltered, idents = 
+                          c("146_KPC_Pancreas","208_KPC_Pancreas","298_KPC_Pancreas"))
+seurat_objectfiltered <- SetIdent(seurat_objectfiltered, cells = cells.use, value = 'KPC_Pancreas')
+
+cells.use <- WhichCells(seurat_objectfiltered, idents = 
+                          c("KPC_LUC_Liver_221","KPC_LUC_Liver_249","KPC_LUC_Liver_259"))
+seurat_objectfiltered <- SetIdent(seurat_objectfiltered, cells = cells.use, value = 'KPC_LUC_Liver')
+
+seurat_objectfiltered$Tumor_Status <- Idents(seurat_objectfiltered)
+
+```
+
+```{r gene makers}
+
+Idents(seurat_objectfiltered) <- seurat_objectfiltered$seurat_clusters
+cluster.markers <- FindAllMarkers(object = seurat_objectfiltered, only.pos = F, min.pct = 0.1, logfc.threshold = 0.25)
+write.csv(cluster.markers,"Seuratclusters-genemarkers.csv")
+
+Idents(seurat_objectfiltered) <- seurat_objectfiltered$Tumor_Status
+status.markers <- FindAllMarkers(object = seurat_objectfiltered, only.pos = F, min.pct = 0.1, logfc.threshold = 0.25)
+write.csv(status.markers,"Tumorstatus-genemarkers.csv")
+
+Idents(seurat_objectfiltered) <- seurat_objectfiltered$orig.ident
+sampleid.markers <- FindAllMarkers(object = seurat_objectfiltered, only.pos = F, min.pct = 0.1, logfc.threshold = 0.25)
+write.csv(sampleid.markers,"SampleID-genemarkers.csv")
+
+Idents(seurat_objectfiltered) <- seurat_objectfiltered$BlueprintEncodeData
+celltype.markers <- FindAllMarkers(object = seurat_objectfiltered, only.pos = F, min.pct = 0.1, logfc.threshold = 0.25)
+write.csv(sampleid.markers,"Celltype-genemarkers.csv")
+```
+
+```{r pathway analysis}
+markers <- cluster.markers
+top50 <- cluster.markers %>% group_by(cluster) %>% top_n(n = 50, wt = avg_log2FC)
+#rownames(top50) <- top50$gene
+
+m_df = msigdbr(species = "Homo sapiens", category = "H")
+m_df1 = msigdbr(species = "Homo sapiens", category = "C2")
+m_df2 = msigdbr(species = "Homo sapiens", category = "C5")
+
+#valdiated code
+m_list = m_df %>% split(x = .$gene_symbol, f = .$gs_name)
+m_list1 = m_df1 %>% split(x = .$gene_symbol, f = .$gs_name)
+m_list2 = m_df2 %>% split(x = .$gene_symbol, f = .$gs_name)
+
+pathdb <- list()
+pathdb[["Hallmark"]] <- m_list
+pathdb[["C2pathways"]] <- m_list1
+pathdb[["C5pathways"]] <- m_list2
+
+sigmoid = function(x) {
+  1 / (1 + exp(-x))
+}
+
+# pathway identification for each samples
+
+ItaconatevsControls <- cluster.markers
+#ItaconatevsControls$gene <- rownames(markers)
+WholeSampleContrastfgsea <- list()
+for(i in names(pathdb)) {
+  #if(ItaconatevsControls$p_val == 0) {
+  #  ItaconatevsControls$p_val <- ItaconatevsControls$p_val + (sort(unique(ItaconatevsControls$p_val))[2] - sort(unique(ItaconatevsControls$p_val))[2]/2)
+  #}
+  ranks = (-log10(ItaconatevsControls$p_val) +
+             sigmoid(abs(ItaconatevsControls$avg_log2FC))) *
+    sign(ItaconatevsControls$avg_log2FC)
+  names(ranks) <- ItaconatevsControls$gene
+  ranks <- sort(ranks, decreasing = T)
+  ranks <- ranks[!is.na(ranks) & !is.infinite(ranks) & !is.nan(ranks)]
+  WholeSampleContrastfgsea[[i]] <- fgsea(pathways = pathdb[[i]],
+                                         stats = ranks,
+                                         minSize=15,
+                                         maxSize=500,
+                                         nperm=10000)
+}
+
+saveRDS(WholeSampleContrastfgsea,"WholeSampleContrastfgsea.rds")
+
+## pathway identification for each clusters
+
+sampleagnosticcluster <- cluster.markers
+sampleagnosticclusterfgsearesults <- list()
+for(i in names(pathdb)) {
+  for(u in unique(sampleagnosticcluster$cluster)){
+    #if(sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$p_val == 0) {
+    #  sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$p_val <- sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$p_val + (sort(unique(sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$p_val))[2] - sort(unique(sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$p_val))[2]/2)
+    #}
+    ranks = (-log10(sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$p_val) +
+               sigmoid(abs(sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$avg_log2FC))) *
+      sign(sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$avg_log2FC)
+    names(ranks) <- sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$gene
+    ranks <- sort(ranks, decreasing = T)
+    ranks <- ranks[!is.na(ranks) & !is.infinite(ranks) & !is.nan(ranks)]
+    sampleagnosticclusterfgsearesults[[i]][[paste0("Cluster",u)]] <- fgsea(pathways = pathdb[[i]],
+                                                                           stats = ranks,
+                                                                           minSize=15,
+                                                                           maxSize=500,
+                                                                           nperm=10000)
+  }
+}
+
+saveRDS(sampleagnosticclusterfgsearesults,"sampleagnosticclusterfgsearesults.rds")
+
+singledata.orig.markers <- sampleid.markers
+
+sampleagnosticcluster <- singledata.orig.markers
+sampleagnosticclusterfgsearesults <- list()
+for(i in names(pathdb)) {
+  for(u in unique(sampleagnosticcluster$cluster)){
+    #if(sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$p_val == 0) {
+    #  sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$p_val <- sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$p_val + (sort(unique(sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$p_val))[2] - sort(unique(sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$p_val))[2]/2)
+    #}
+    ranks = (-log10(sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$p_val) +
+               sigmoid(abs(sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$avg_log2FC))) *
+      sign(sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$avg_log2FC)
+    names(ranks) <- sampleagnosticcluster[sampleagnosticcluster$cluster == u,]$gene
+    ranks <- sort(ranks, decreasing = T)
+    ranks <- ranks[!is.na(ranks) & !is.infinite(ranks) & !is.nan(ranks)]
+    sampleagnosticclusterfgsearesults[[i]][[paste0("Cluster",u)]] <- fgsea(pathways = pathdb[[i]],
+                                                                           stats = ranks,
+                                                                           minSize=15,
+                                                                           maxSize=500,
+                                                                           nperm=10000)
+  }
+}
+
+saveRDS(sampleagnosticclusterfgsearesults,"sampleagnosticclusterfgsearesults.rds")
+
+```

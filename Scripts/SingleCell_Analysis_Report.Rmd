@@ -1,0 +1,1017 @@
+---
+title: "scRNA-seq Analysis Report"
+output:
+  html_document:
+    smooth_scroll: yes
+    toc: yes
+    toc_depth: 1
+    toc_float: yes
+    thumbnails: true
+    lightbox: true
+    gallery : true
+---
+
+
+```{r knitr_init, echo=FALSE, cache=FALSE, warning = F}
+library(knitr)
+library(rmdformats)
+## Global options
+options(max.print="95")
+opts_chunk$set(echo=FALSE,
+               cache=FALSE,
+               prompt=FALSE, 
+               tidy=FALSE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE,
+               fig.retina = 1.5,
+               pngquant = '--speed=1 --nofs')
+opts_knit$set(width=95)
+## IMG optimization
+knit_hooks$set(pngquant = hook_pngquant)
+
+```
+
+```{r Setup Environment}
+library(DT)
+library(ggplot2)
+library(corrplot)
+library(grid)
+library(dplyr)
+library(Seurat)
+library(sctransform)
+library(clustree)
+#library(ggdendro)
+library(parallel)
+library(fgsea)
+library(ggrepel)
+library(pheatmap)
+library(scales)
+library(SingleR)
+library(msigdbr)
+library(openxlsx)
+library(stats)
+library(readxl)
+library(future)
+
+plan("multiprocess", workers = 6)
+options(future.globals.maxSize = 1000 * 2024^2)
+
+#Set working directory, configured for PC currently
+ #setwd("C:/Users/mjc239/Cameron Lab Dropbox/Mike Cartwright/Cartwright - Analysis/Butto")
+
+
+options(max.print=10000)
+
+m_df = msigdbr(species = "Homo sapiens", category = "H")
+m_df1 = msigdbr(species = "Homo sapiens", category = "C2")
+m_df2 = msigdbr(species = "Homo sapiens", category = "C5")
+#m_df3 = msigdbr(species = "Mus musculus", category = "C7")
+
+#valdiated code
+m_list = m_df %>% split(x = .$gene_symbol, f = .$gs_name)
+m_list1 = m_df1 %>% split(x = .$gene_symbol, f = .$gs_name)
+m_list2 = m_df2 %>% split(x = .$gene_symbol, f = .$gs_name)
+#m_list3 = m_df3 %>% split(x = .$gene_symbol, f = .$gs_name)
+
+ pathdb <- list()
+ pathdb[["Hallmark"]] <- m_list
+ pathdb[["C2pathways"]] <- m_list1
+ pathdb[["C5pathways"]] <- m_list2
+
+# Based on code from http://michaeljw.com/blog/post/subchunkify/
+
+#' Generate a sub-chunk to be interpreted by knitr.  The enclosing chunk
+#' must have "results='asis'"
+#'
+#' @param g The output to chunkify (only tested with figures to date)
+#' @param ... Additional named arguments to the chunk
+#' @return NULL
+#' @details The chunk is automatically output to the console.  There is
+#'   no need to print/cat its result.
+#' @export
+
+subchunkify <- local({
+ chunk_count <- 0
+ function(g, ...) {
+   chunk_count <<- chunk_count + 1
+   g_deparsed <-
+     paste0(deparse(
+       function() {g}
+     ),
+     collapse = '')
+   args <- list(...)
+   args <-
+     lapply(names(args),
+            FUN=function(nm, arglist) {
+              current <- arglist[[nm]]
+              if (length(current) > 1) {
+                stop("Only scalars are supported by subchunkify")
+              } else if (is.character(current) | is.factor(current)) {
+                current <- as.character(current)
+                ret <- paste0('"', gsub('"', '\"', current, fixed=TRUE), '"')
+              } else if (is.numeric(current) | is.logical(current)) {
+                ret <- as.character(current)
+              } else {
+                stop("Unhandled class in subchunkify argument handling")
+              }
+              paste0(nm, "=", ret)
+            },
+            arglist=args)
+   args <- paste0(unlist(args), collapse=", ")
+   chunk_header <-
+     paste(
+       paste0("{r sub_chunk_", chunk_count),
+       if (nchar(args) > 0) {
+         paste(",", args)
+       } else {
+         NULL
+       },
+       ", echo=FALSE}")
+   
+   sub_chunk <- paste0(
+     "\n```",chunk_header, "\n",
+     "(", 
+     g_deparsed
+     , ")()\n",
+     "```\n")
+   cat(knitr::knit(text = knitr::knit_expand(text = sub_chunk), quiet = TRUE))
+ }
+})
+
+gradient.hm <- function(genes=geneSet,
+                        AssocData=toptable,
+                        PathwayData=NULL,
+                        Estimate='logFC',
+                        const=F,
+                        max=NULL,
+                        numGenes=50,
+                        orderBy="consensus",
+                        annotate_col_labels=NULL,
+                        annotate_row_labels=NULL,
+                        main="Checkerboard",
+                        silent=F){
+  
+  ## Get unique gene symbols from all pathways
+  unique.genes <- na.omit(unique(unlist(genes)))
+  
+  ## Create matrix.  One row for each pathway.  One column for each
+  ## unique gene.
+  mat <- matrix(NA,
+                nrow=length(genes),
+                ncol=length(unique.genes))
+  colnames(mat) <- unique.genes
+  rownames(mat) <- names(genes)
+  
+  ## Fill in values of matrix with Estimates for each gene.  This fills
+  ## in a cell even if the gene is not a pathway.
+  for(i in rownames(mat)){ # Loop over each pathway
+    for(j in colnames(mat)){ # Loop over each gene.
+      if (j %in% genes[[i]]) {
+        val <- AssocData[AssocData$symbol == j, Estimate]
+        if (length(val) == 1) {
+          mat[i,j] <- val
+        } else {
+          mat[i,j] <- NA
+        }
+      } else
+        mat[i,j] <- NA
+    }
+  }
+  
+  # remove genes that have no expression values and order by p.value
+  mat <- mat[, colSums(is.na(mat)) !=nrow(mat), drop=F]
+  
+  AssocData <- AssocData[colnames(mat), ]
+  
+  # order genes by consensus, logfc or p.value
+  for (order in orderBy) {
+    if (order == "consensus"){
+      mat <- mat[, order(colSums(is.na(mat))), drop = F]
+    } else {
+      if (range(AssocData[[order]])[2] > 1) { # Check if logFC
+        mat <- mat[, order(abs(AssocData[[order]]), decreasing = T), drop = F]
+      } else {
+        mat <- mat[, order(AssocData[[order]]), drop = F]
+      }
+    }
+  }
+  
+  # trim gene list if too long
+  if (dim(mat)[2] > numGenes) {
+    mat <- mat[,1:numGenes, drop=F]
+  }
+  
+  # remove pathways that have no genes
+  mat <- mat[rowSums(is.na(mat)) !=ncol(mat), , drop=F]
+  
+  # Check if any genes are left
+  if (is.null(mat)) {
+    return("No genes pass filter")
+  }
+  
+  ## Order columns of mat by regression coeffiecient.  This makes it so
+  ## that all genes in the first pathway will be shown on the left side
+  ## of the plot.
+  for(i in 1:nrow(mat)){
+    mat <- mat[,order(mat[i,]), drop=F]
+  }
+  
+  ## Subset final mat
+  mat <- mat[nrow(mat):1, , drop=F]
+  
+  if(const == T){
+    if (is.null(max)) {
+      max <- max(abs(mat), na.rm=T)
+    }
+    seq <- seq(from = -max, to = max, length.out=20)
+    colors <- colorRampPalette(c('#1d587c','#2b83ba', '#abdda4','#ffffbf','#fdae61','#d7191c','#891012'))(length(seq))
+  } else {
+    seq <- seq(floor(min(mat, na.rm=T)), ceiling(max(mat, na.rm=T)), length.out=99)
+    colors <- colorRampPalette(c('#2b83ba', '#abdda4','#ffffbf','#fdae61','#d7191c'))(99)
+  }
+  
+  ## Create column annotation if present
+  if (!is.null(annotate_col_labels)) {
+    annotate_col <- AssocData[colnames(mat), annotate_col_labels, drop=F]
+  } else {
+    annotate_col <- NULL
+  }
+  
+  ## Create row annotation if present
+  if (!is.null(annotate_row_labels) & !is.null(PathwayData)) {
+    annotate_row <- PathwayData[rownames(mat), annotate_row_labels, drop=F]
+  } else {
+    annotate_row <- NULL
+  }
+  
+  
+  ## Create plot
+  
+  require(pheatmap)
+  
+  pheatmap(mat,
+           color=colors,
+           breaks=seq,
+           annotation_col=annotate_col,
+           annotation_row=annotate_row,
+           annotation_names_row=F,
+           annotation_names_col=F,
+           border_color='azure2',
+           cluster_cols=FALSE,
+           cluster_rows=FALSE,
+           cellheight = 12,
+           cellwidth = 12,
+           main = main,
+           labels_row = substr(rownames(mat),1,40),
+           fontsize=6,
+           silent = silent,
+           na_col = "#FFFFFF")
+  
+}
+
+suppressPackageStartupMessages({
+  library(rlang)
+})
+
+DoMultiBarHeatmap <- function (object, 
+                               features = NULL, 
+                               cells = NULL, 
+                               group.by = "ident", 
+                               additional.group.by = NULL, 
+                               additional.group.sort.by = NULL, 
+                               cols.use = NULL,
+                               group.bar = TRUE, 
+                               disp.min = -2.5, 
+                               disp.max = NULL, 
+                               slot = "scale.data", 
+                               assay = NULL, 
+                               label = TRUE, 
+                               size = 5.5, 
+                               hjust = 0, 
+                               angle = 45, 
+                               raster = TRUE, 
+                               draw.lines = TRUE, 
+                               lines.width = NULL, 
+                               group.bar.height = 0.02, 
+                               combine = TRUE) 
+{
+  cells <- cells %||% colnames(x = object)
+  if (is.numeric(x = cells)) {
+    cells <- colnames(x = object)[cells]
+  }
+  assay <- assay %||% DefaultAssay(object = object)
+  DefaultAssay(object = object) <- assay
+  features <- features %||% VariableFeatures(object = object)
+  ## Why reverse???
+  features <- rev(x = unique(x = features))
+  disp.max <- disp.max %||% ifelse(test = slot == "scale.data", 
+                                   yes = 2.5, no = 6)
+  possible.features <- rownames(x = GetAssayData(object = object, 
+                                                 slot = slot))
+  if (any(!features %in% possible.features)) {
+    bad.features <- features[!features %in% possible.features]
+    features <- features[features %in% possible.features]
+    if (length(x = features) == 0) {
+      stop("No requested features found in the ", slot, 
+           " slot for the ", assay, " assay.")
+    }
+    warning("The following features were omitted as they were not found in the ", 
+            slot, " slot for the ", assay, " assay: ", paste(bad.features, 
+                                                             collapse = ", "))
+  }
+  
+  if (!is.null(additional.group.sort.by)) {
+    if (any(!additional.group.sort.by %in% additional.group.by)) {
+      bad.sorts <- additional.group.sort.by[!additional.group.sort.by %in% additional.group.by]
+      additional.group.sort.by <- additional.group.sort.by[additional.group.sort.by %in% additional.group.by]
+      if (length(x = bad.sorts) > 0) {
+        warning("The following additional sorts were omitted as they were not a subset of additional.group.by : ", 
+                paste(bad.sorts, collapse = ", "))
+      }
+    }
+  }
+  
+  data <- as.data.frame(x = as.matrix(x = t(x = GetAssayData(object = object, 
+                                                             slot = slot)[features, cells, drop = FALSE])))
+  
+  object <- suppressMessages(expr = StashIdent(object = object, 
+                                               save.name = "ident"))
+  group.by <- group.by %||% "ident"
+  groups.use <- object[[c(group.by, additional.group.by[!additional.group.by %in% group.by])]][cells, , drop = FALSE]
+  plots <- list()
+  for (i in group.by) {
+    data.group <- data
+    if (!is_null(additional.group.by)) {
+      additional.group.use <- additional.group.by[additional.group.by!=i]  
+      if (!is_null(additional.group.sort.by)){
+        additional.sort.use = additional.group.sort.by[additional.group.sort.by != i]  
+      } else {
+        additional.sort.use = NULL
+      }
+    } else {
+      additional.group.use = NULL
+      additional.sort.use = NULL
+    }
+    
+    group.use <- groups.use[, c(i, additional.group.use), drop = FALSE]
+    
+    for(colname in colnames(group.use)){
+      if (!is.factor(x = group.use[[colname]])) {
+        group.use[[colname]] <- factor(x = group.use[[colname]])
+      }  
+    }
+    
+    if (draw.lines) {
+      lines.width <- lines.width %||% ceiling(x = nrow(x = data.group) * 
+                                                0.0025)
+      placeholder.cells <- sapply(X = 1:(length(x = levels(x = group.use[[i]])) * 
+                                           lines.width), FUN = function(x) {
+                                             return(Seurat:::RandomName(length = 20))
+                                           })
+      placeholder.groups <- data.frame(rep(x = levels(x = group.use[[i]]), times = lines.width))
+      group.levels <- list()
+      group.levels[[i]] = levels(x = group.use[[i]])
+      for (j in additional.group.use) {
+        group.levels[[j]] <- levels(x = group.use[[j]])
+        placeholder.groups[[j]] = NA
+      }
+      
+      colnames(placeholder.groups) <- colnames(group.use)
+      rownames(placeholder.groups) <- placeholder.cells
+      
+      group.use <- sapply(group.use, as.vector)
+      rownames(x = group.use) <- cells
+      
+      group.use <- rbind(group.use, placeholder.groups)
+      
+      for (j in names(group.levels)) {
+        group.use[[j]] <- factor(x = group.use[[j]], levels = group.levels[[j]])
+      }
+      
+      na.data.group <- matrix(data = NA, nrow = length(x = placeholder.cells), 
+                              ncol = ncol(x = data.group), dimnames = list(placeholder.cells, 
+                                                                           colnames(x = data.group)))
+      data.group <- rbind(data.group, na.data.group)
+    }
+    
+    order_expr <- paste0('order(', paste(c(i, additional.sort.use), collapse=','), ')')
+    group.use = with(group.use, group.use[eval(parse(text=order_expr)), , drop=F])
+    
+    plot <- Seurat:::SingleRasterMap(data = data.group, raster = raster, 
+                                     disp.min = disp.min, disp.max = disp.max, feature.order = features, 
+                                     cell.order = rownames(x = group.use), group.by = group.use[[i]])
+    
+    if (group.bar) {
+      pbuild <- ggplot_build(plot = plot)
+      group.use2 <- group.use
+      cols <- list()
+      na.group <- Seurat:::RandomName(length = 20)
+      for (colname in rev(x = colnames(group.use2))) {
+        if (colname == i) {
+          colid = paste0('Identity (', colname, ')')
+        } else {
+          colid = colname
+        }
+        
+        # Default
+        cols[[colname]] <- c(scales::hue_pal()(length(x = levels(x = group.use[[colname]]))))  
+        
+        #Overwrite if better value is provided
+        if (!is_null(cols.use[[colname]])) {
+          req_length = length(x = levels(group.use))
+          if (length(cols.use[[colname]]) < req_length){
+            warning("Cannot use provided colors for ", colname, " since there aren't enough colors.")
+          } else {
+            if (!is_null(names(cols.use[[colname]]))) {
+              if (all(levels(group.use[[colname]]) %in% names(cols.use[[colname]]))) {
+                cols[[colname]] <- as.vector(cols.use[[colname]][levels(group.use[[colname]])])
+              } else {
+                warning("Cannot use provided colors for ", colname, " since all levels (", paste(levels(group.use[[colname]]), collapse=","), ") are not represented.")
+              }
+            } else {
+              cols[[colname]] <- as.vector(cols.use[[colname]])[c(1:length(x = levels(x = group.use[[colname]])))]
+            }
+          }
+        }
+        
+        # Add white if there's lines
+        if (draw.lines) {
+          levels(x = group.use2[[colname]]) <- c(levels(x = group.use2[[colname]]), na.group)  
+          group.use2[placeholder.cells, colname] <- na.group
+          cols[[colname]] <- c(cols[[colname]], "#FFFFFF")
+        }
+        names(x = cols[[colname]]) <- levels(x = group.use2[[colname]])
+        
+        y.range <- diff(x = pbuild$layout$panel_params[[1]]$y.range)
+        y.pos <- max(pbuild$layout$panel_params[[1]]$y.range) + y.range * 0.015
+        y.max <- y.pos + group.bar.height * y.range
+        pbuild$layout$panel_params[[1]]$y.range <- c(pbuild$layout$panel_params[[1]]$y.range[1], y.max)
+        
+        plot <- suppressMessages(plot + 
+                                   annotation_raster(raster = t(x = cols[[colname]][group.use2[[colname]]]),  xmin = -Inf, xmax = Inf, ymin = y.pos, ymax = y.max) + 
+                                   annotation_custom(grob = grid::textGrob(label = colid, hjust = 0, gp = gpar(cex = 0.75)), ymin = mean(c(y.pos, y.max)), ymax = mean(c(y.pos, y.max)), xmin = Inf, xmax = Inf) +
+                                   coord_cartesian(ylim = c(0, y.max), clip = "off")) 
+        
+        if ((colname == i) && label) {
+          x.max <- max(pbuild$layout$panel_params[[1]]$x.range)
+          x.divs <- pbuild$layout$panel_params[[1]]$x.major %||% pbuild$layout$panel_params[[1]]$x$break_positions()
+          group.use$x <- x.divs
+          label.x.pos <- tapply(X = group.use$x, INDEX = group.use[[colname]],
+                                FUN = median) * x.max
+          label.x.pos <- data.frame(group = names(x = label.x.pos), 
+                                    label.x.pos)
+          plot <- plot + geom_text(stat = "identity", 
+                                   data = label.x.pos, aes_string(label = "group", 
+                                                                  x = "label.x.pos"), y = y.max + y.max * 
+                                     0.03 * 0.5, angle = angle, hjust = hjust, 
+                                   size = size)
+          plot <- suppressMessages(plot + coord_cartesian(ylim = c(0, 
+                                                                   y.max + y.max * 0.002 * max(nchar(x = levels(x = group.use[[colname]]))) * 
+                                                                     size), clip = "off"))
+        }
+      }
+    }
+    plot <- plot + theme(line = element_blank())
+    plots[[i]] <- plot
+  }
+  if (combine) {
+    plots <- CombinePlots(plots = plots)
+  }
+  return(plots)
+}
+
+```
+
+
+# Sample Stats {.tabset .tabset-pills}
+
+## Number of Cells in the Samples {.tabset .tabset-pills}
+
+```{r number of cells in the samples}
+
+singledata <- readRDS("scRNA_data.rds")
+
+metadata <- singledata@meta.data
+metadata$cells <- rownames(metadata)
+metadata <- metadata %>%
+  dplyr::rename(seq_folder = orig.ident,
+                nUMI = nCount_RNA,
+                nGene = nFeature_RNA)
+metadata$sample <- metadata$seq_folder
+
+metadata %>% 
+  ggplot(aes(x=sample, fill=sample)) +
+  theme_classic() + geom_bar() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("COV VAC PBMC dataset - NCells")
+
+```
+
+# Cluster Analysis {.tabset .tabset-pills}
+
+## Overview & UMAP {.tabset .tabset-pills}
+
+```{r singledata UMAPplot, eval = T, results='asis', warning=F, message=F}
+
+fgsearesults <- readRDS("sampleagnosticclusterfgsearesults.rds")
+cluster.markers <- read.csv("Seuratclusters-genemarkers.csv")
+samplecontrastfgsea <- readRDS("WholeSampleContrastfgsea.rds")
+
+singledata$ludolabel <- "hello"
+for(u in sort(as.numeric(unique(singledata$seurat_clusters)))) {
+tempnames <- names(which(singledata$seurat_clusters == u))
+tempcell <- names(sort(table(singledata$CombinedRef[tempnames]), decreasing = T)[1])
+singledata$ludolabel[tempnames] <- paste0(u,"-", tempcell)
+}
+
+cat("\n\n### UMAP Plot\n")
+
+subchunkify(DimPlot(object = singledata, reduction = "umap", label=T, raster = FALSE)+
+              ggtitle(paste0("Samples in UMAP, Resolution = ", singledata@commands$FindClusters$resolution)) +
+              theme(plot.title = element_text(size = 8)), fig.width = 8, fig.height = 4)
+
+subchunkify(DimPlot(object = singledata, reduction = "umap", label=F, group.by = "orig.ident", raster = FALSE)+
+              ggtitle(paste0("COV VAC PBMC Samples overlayed in UMAP, Resolution = ", singledata@commands$FindClusters$resolution)) +
+              theme(plot.title = element_text(size = 8)), fig.width = 8, fig.height = 4)
+
+tab <- sapply(sort(unique(singledata$seurat_clusters)), function(cluster) {
+       sapply(unique(singledata$orig.ident), function(ident) {
+                length(which(singledata$orig.ident == ident & singledata$seurat_clusters == cluster))
+})})
+
+colnames(tab) <- paste0("c", sort(unique(singledata$seurat_clusters))) 
+
+knitr::kable(tab, caption = "Number of cells per Cluster")
+
+cat("\n\n### Individual Sample UMAP Plots\n") 
+
+knitr::kable(tab, caption = "Sample Contribution per Cluster")
+
+for (ident in unique(singledata$orig.ident)) {
+
+  print(DimPlot(object = singledata, reduction = "umap", label=T, cells = singledata$orig.ident == ident, raster = FALSE) + labs(title = ident))
+  
+}
+
+cat("\n\n### Cluster vs. Sample\n")
+
+x = table(singledata$seurat_clusters,singledata$orig.ident)
+
+data <- as.data.frame(x)
+
+colnames(data) <- c("Cluster","Sample","Frequency")
+
+print(ggplot(data=data, aes(x=Cluster, y=Frequency, fill=Sample)) + 
+  geom_col(position = "fill") + coord_flip() + 
+  ggtitle("COV VAC PBMC Analysis - Cluster vs. Sample"))
+
+
+cat("\n\n### Searchable Gene List\n")
+
+cluster.markers[,c("cluster","gene", "p_val", "p_val_adj","avg_log2FC","pct.1", "pct.2")] %>%
+  mutate(gene=paste0("<a href='https://www.genecards.org/cgi-bin/carddisp.pl?gene=",gene,"'>",gene,"</a>")) %>% 
+  datatable(escape = F)
+
+
+```
+
+## Combined Cluster Markers {.tabset .tabset-pills}
+
+```{r singledata Marker Plots, eval = T, results='asis', warning=F, message=F}
+
+primary.markers <- cluster.markers %>% group_by(cluster) %>% top_n(n = 1, wt = avg_log2FC)
+
+cat("\n\n### Violin Plots\n")
+
+subchunkify(VlnPlot(object = singledata, features = primary.markers$gene, log = T, pt.size = 0, ncol = 2), fig.width = 10, fig.height = 24)
+
+cat("\n\n### Feature Plots\n")
+
+subchunkify(FeaturePlot(object = singledata, features = primary.markers$gene, ncol = 2, label = T), fig.width = 10, fig.height = 32)
+```
+
+***
+
+## Heatmap of Combined Clusters' Top 5 Markers
+
+```{r Combined Marker Heatmap, fig.height=24, fig.width=25, eval = T}
+cluster.markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC) -> top5LR
+DoHeatmap(object = singledata, features = as.character(top5LR$gene), label=T, size =5) +
+  theme(legend.key.size = unit(.75,"inches"),
+        legend.title = element_text(size=15),
+        legend.text = element_text(size=15),
+        axis.text.y=element_text(size=15), 
+        strip.text.y=element_text(angle=0, vjust=0.5, hjust=0.5, size=15)) 
+```
+
+## Dotplot of Seurat clusters' Top 10 Markers
+
+```{r Seurat cluster Marker dotplot}
+
+cluster_mar <- read.csv("Seuratclusters-genemarkers.csv")
+
+cluster_mar %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC) -> top10
+
+for (ident in unique(singledata$seurat_clusters)) {
+
+  cluster <- subset(top10,top10$cluster == ident)
+  features <- cluster$gene
+ Idents(singledata) <- singledata$seurat_clusters
+ print(DotPlot(singledata,features = features) + RotatedAxis() + labs(title = ident))
+  
+}
+
+```
+
+## Sample vs. Seurat clusters
+
+```{r Samples vs. Seurat clusters}
+
+for (ident in unique(singledata$orig.ident)) {
+  
+  sample <- subset(singledata, cells = 
+              rownames(singledata@meta.data[singledata@meta.data$orig.ident
+                                                  %in% ident, ]))
+  x <- as.data.frame(table(sample$seurat_clusters))
+  colnames(x) <- c("cluster","Frequency")
+  
+  data <- as.data.frame(x$Frequency)
+  colnames(data) <- c("n")
+  data <- data %>% dplyr::mutate(perc = paste0(sprintf("%4.1f", n / sum(n) * 100), "%"))
+  
+  print(ggplot(data, aes(x = n, y = x$cluster)) +
+          geom_col(fill = "orange") +
+          geom_text(aes(label = perc)) +
+          theme_minimal() +
+          xlab("Number of cells") + ylab("Cluster") + labs(title = ident))
+}
+
+```
+
+
+## Pathway Plots {.tabset .tabset-pills}
+
+```{r  Clus_agnos sample path, eval = T, results='asis', warning=F, message=F, fig.height=8, fig.width=12}
+
+sampleclusterfgsea <- readRDS("WholeSampleContrastfgsea.rds")
+
+cat("\n\n### Pathway Bar Plot\n")
+
+for (u in names(sampleclusterfgsea)) {
+tempfgseaHpgdc6 <- sampleclusterfgsea[[u]]
+tempfgseaHpgdc6 <- tempfgseaHpgdc6[tempfgseaHpgdc6$pval < 0.05,]
+ topTable.temp <- data.frame(pathway = tempfgseaHpgdc6$pathway, P.Value = -log10(tempfgseaHpgdc6$pval) * sign(tempfgseaHpgdc6$NES))
+if (dim(topTable.temp)[1] > 50) {
+n <- 50
+} else {
+n <- dim(topTable.temp)[1]
+}
+topTable.temp <- topTable.temp[order(topTable.temp$P.Value),]
+topTable.temp$pathway <- factor(topTable.temp$pathway, levels = topTable.temp$pathway)
+
+print(ggplot(topTable.temp[1:n, ], aes(x = pathway, y = P.Value, fill = P.Value)) + geom_bar(stat = 'identity', show.legend = F) + coord_flip() + labs(x = "Pathway", y = "-Log10 (Nominal p-value) * sign NES", title = paste0(" COV VAC PBMC - ",u)))
+
+}
+```
+
+## Checkerboard Plot
+
+```{r Clus_agnos Sample checker, eval = T, results='asis', warning=F, message=F, fig.height = 4, fig.width = 11}
+
+
+clustergenemarkers <- read.csv("Seuratclusters-genemarkers.csv")
+sampleclusterfgsea <- readRDS("WholeSampleContrastfgsea.rds")
+
+clustergenemarkers$gene <- rownames(clustergenemarkers)
+
+for (u in names(sampleclusterfgsea)) {
+top.tmp <- as.data.frame(clustergenemarkers)
+top.tmp$gene <- top.tmp$X
+row.names(top.tmp) <- top.tmp$gene
+
+
+# Subset table to only include pval significant genes
+top.tmp <- top.tmp[top.tmp$p_val < 0.05, ]
+#top.tmp$pval_new <- ifelse(top.tmp$p_val == 0, "p < 0.1E-20", "p < 0.2E-20")
+
+# Select pathways to plot
+geneSet <- pathdb[[u]]
+
+# Get top pathways
+res.tmp <- as.data.frame(na.omit(sampleclusterfgsea[[u]][sampleclusterfgsea[[u]]$pval < 0.05, ]))
+
+
+if (dim(res.tmp)[1] > 10) {
+  res.tmp <- res.tmp[order(res.tmp$pval),]
+  res.tmp <- res.tmp[res.tmp$pathway %in% names(geneSet),]
+  res.tmp <- res.tmp[1:10, ]
+}
+
+geneSet.tmp <- geneSet[res.tmp$pathway]
+
+# Get leading edge Genes
+leadEdge <- unique(unlist(res.tmp$leadingEdge))
+top.tmp <- top.tmp[top.tmp$gene %in% leadEdge, ]
+
+if (nrow(top.tmp) == 0) {
+  next
+}
+
+#Cleanup
+rownames(top.tmp) <- top.tmp$gene
+top.tmp$symbol <- top.tmp$gene
+rownames(res.tmp) <- res.tmp$pathway
+
+
+
+gradient.hm(genes=geneSet.tmp,            
+            AssocData=top.tmp, 
+            PathwayData=res.tmp,
+            Estimate='avg_log2FC',
+            const=T,                                                   
+            max=NULL,                            
+            numGenes=50,                           
+            orderBy="consensus",                   
+            #annotate_col_labels="p_val",
+            #annotate_row_labels= "NES",        
+            main=paste0("COV VAC PBMC - ", u),
+            silent=F)
+}
+
+```
+
+***
+
+# Sample Annotation Analysis {.tabset .tabset-pills}
+
+## Responder vs. Nonresponder UMAP {.tabset .tabset-pills}
+
+```{r PD1-TIGIT-vs-Iso analysis, eval = T, results='asis', warning=F, message=F}
+
+Idents(singledata) <- singledata$orig.ident
+
+cells.use <- WhichCells(singledata, idents = 
+                          c("XV229","XV257","XV324","XV309","XV177","XV269"))
+singledata <- SetIdent(singledata, cells = cells.use, value = 'Nonresponder')
+cells.use <- WhichCells(singledata, idents = 
+                          c("XV256","XV127","XV232","XV321","XV301","XV313"))
+singledata <- SetIdent(singledata, cells = cells.use, value = 'Responder')
+
+singledata$Covid_Status <- Idents(singledata)
+
+Idents(singledata) <- singledata$seurat_clusters
+
+subchunkify(DimPlot(singledata, reduction = "umap", split.by = "Covid_Status", label = T, repel = TRUE, raster = FALSE) +
+              ggtitle(paste0("Responder vs. Nonresponder")) +
+              theme(plot.title = element_text(size = 8)), fig.width = 8, fig.height = 4)
+
+
+
+```
+
+## Responder vs. Nonresponder Frequency {.tabset .tabset-pills}
+
+```{r PD1-TIGIT-vs-Iso Frequency}
+
+x = table(singledata$seurat_clusters,singledata$Covid_Status)
+
+data <- as.data.frame(x)
+
+colnames(data) <- c("Cluster","Sample","Frequency")
+
+ggplot(data=data, aes(x=Cluster, y=Frequency, fill=Sample)) + 
+  geom_col(position = "fill") + coord_flip()
+
+
+
+```
+
+## Heatmap of Responder vs. Nonresponder Top 50 Markers
+
+```{r PD1-TIGIT vs. Iso Heatmap, fig.height=24, fig.width=25, eval = T}
+
+covidstatus.markers <- read.csv("Covidstatus-genemarkers.csv")
+
+covidstatus.markers %>% group_by(cluster) %>% top_n(n = 50, wt = avg_log2FC) -> top50LR
+
+Idents(singledata) <- singledata$Covid_Status
+
+DoHeatmap(object = singledata, features = as.character(top50LR$gene), label=T, size =5) +
+  theme(legend.key.size = unit(.75,"inches"),
+        legend.title = element_text(size=15),
+        legend.text = element_text(size=15),
+        axis.text.y=element_text(size=15), 
+        strip.text.y=element_text(angle=0, vjust=0.5, hjust=0.5, size=15)) 
+
+```
+
+
+# Annotated Cell Type Plots {.tabset .tabset-pills}
+
+## Overview & UMAP {.tabset .tabset-pills}
+```{r Cell type Annotation UMAPplot, eval = T, results='asis', warning=F, message=F}
+
+#LRmarkers <- read.csv(file = "FilteredLowResolutionMarkers.csv", row.names = 1, stringsAsFactors = F)
+
+cat("\n\n### UMAP Plot\n")
+
+tab <- sapply(sort(unique(singledata$seurat_clusters)), function(cluster) {
+       sapply(unique(singledata$CombinedRef), function(ident) {
+                length(which(singledata$CombinedRef == ident & singledata$seurat_clusters == cluster))
+})})
+
+colnames(tab) <- paste0(sort(unique(singledata$seurat_clusters))) 
+knitr::kable(tab, caption = "Cell Type per Cluster")
+
+subchunkify(DimPlot(singledata, reduction = "umap", group.by = "CombinedRef", label = T, repel = TRUE, raster = FALSE) +
+              ggtitle(paste0("Cell type")) +
+              theme(plot.title = element_text(size = 8)), fig.width = 8, fig.height = 4)
+
+cat("\n\n### Cell Type by Sample")
+
+tab <- sapply(sort(unique(singledata$CombinedRef)), function(type) {
+       sapply(unique(singledata$orig.ident), function(ident) {
+                length(which(singledata$orig.ident == ident & singledata$CombinedRef == type))
+})})
+
+colnames(tab) <- paste0(sort(unique(singledata$CombinedRef))) 
+knitr::kable(tab, caption = "Sample Contribution per Cell Type")
+
+chitable <- chisq.test(tab)
+subchunkify(corrplot(chitable$residuals, is.corr = F, sig.level = 5, title = paste0("\n ChiSquare Test Residuals"," P-val = ",chitable$p.value), fig.width = 10, fig.height = 8))
+
+for (ident in unique(singledata$orig.ident)) {
+
+  print(DimPlot(object = singledata, reduction = "umap", group.by = "CombinedRef", label=T, cells = singledata$orig.ident == ident, repel = TRUE, raster = FALSE) + labs(title = ident))
+  
+}
+
+```
+
+## Cell type vs. Seurat cluster {.tabset .tabset-pills}
+
+```{r Cell type cell proportion analysis}
+
+x = table(singledata$seurat_clusters,singledata$CombinedRef)
+
+data <- as.data.frame(x)
+
+colnames(data) <- c("Cluster","Celltype","Frequency")
+
+print(ggplot(data=data, aes(x=Cluster, y=Frequency, fill=Celltype)) + 
+  geom_col(position = "fill") + coord_flip() +
+  ggtitle("COV VAC PBMC Analysis - Cluster vs. Celltype"))
+
+```
+
+
+## Cell type Stats {.tabset .tabset-pills}
+
+```{r Cell type percentage in different databases}
+
+x <- as.data.frame(table(singledata$CombinedRef))
+
+colnames(x) <- c("celltype","Frequency")
+
+data <- as.data.frame(x$Frequency)
+colnames(data) <- c("n")
+data <- data %>% dplyr::mutate(perc = paste0(sprintf("%4.1f", n / sum(n) * 100), "%"))
+
+p <- ggplot(data, aes(x = n, y = x$celltype)) +
+  geom_col(fill = "orange") +
+  geom_text(aes(label = perc)) +
+  theme_minimal() +
+  xlab("Number of cells") + ylab("Cell type")
+
+print(p + ggtitle("COV VAC PBMC Analysis - Combined reference database"))
+
+x <- as.data.frame(table(singledata$HumanPrimaryCellAtlasData))
+
+colnames(x) <- c("celltype","Frequency")
+
+data <- as.data.frame(x$Frequency)
+colnames(data) <- c("n")
+data <- data %>% dplyr::mutate(perc = paste0(sprintf("%4.1f", n / sum(n) * 100), "%"))
+
+p <- ggplot(data, aes(x = n, y = x$celltype)) +
+  geom_col(fill = "orange") +
+  geom_text(aes(label = perc)) +
+  theme_minimal() +
+  xlab("Number of cells") + ylab("Cell type")
+
+print(p + ggtitle("COV VAC PBMC Analysis - Human Primary Cell Atlas Data"))
+
+x <- as.data.frame(table(singledata$DatabaseImmuneCellExpressionData))
+
+colnames(x) <- c("celltype","Frequency")
+
+data <- as.data.frame(x$Frequency)
+colnames(data) <- c("n")
+data <- data %>% dplyr::mutate(perc = paste0(sprintf("%4.1f", n / sum(n) * 100), "%"))
+
+p <- ggplot(data, aes(x = n, y = x$celltype)) +
+  geom_col(fill = "orange") +
+  geom_text(aes(label = perc)) +
+  theme_minimal() +
+  xlab("Number of cells") + ylab("Cell type")
+
+print(p + ggtitle("COV VAC PBMC Analysis - Immune Cell Expression Data"))
+
+
+x <- as.data.frame(table(singledata$MonacoImmuneData))
+
+colnames(x) <- c("celltype","Frequency")
+
+data <- as.data.frame(x$Frequency)
+colnames(data) <- c("n")
+data <- data %>% dplyr::mutate(perc = paste0(sprintf("%4.1f", n / sum(n) * 100), "%"))
+
+p <- ggplot(data, aes(x = n, y = x$celltype)) +
+  geom_col(fill = "orange") +
+  geom_text(aes(label = perc)) +
+  theme_minimal() +
+  xlab("Number of cells") + ylab("Cell type")
+
+print(p + ggtitle("COV VAC PBMC Analysis - Monaco Immune Data"))
+
+x <- as.data.frame(table(singledata$BlueprintEncodeData))
+
+colnames(x) <- c("celltype","Frequency")
+
+data <- as.data.frame(x$Frequency)
+colnames(data) <- c("n")
+data <- data %>% dplyr::mutate(perc = paste0(sprintf("%4.1f", n / sum(n) * 100), "%"))
+
+p <- ggplot(data, aes(x = n, y = x$celltype)) +
+  geom_col(fill = "orange") +
+  geom_text(aes(label = perc)) +
+  theme_minimal() +
+  xlab("Number of cells") + ylab("Cell type")
+
+print(p + ggtitle("COV VAC PBMC Analysis - Blueprint Encode Data"))
+
+```
+
+## Heatmap of Cell types' Top 5 Markers
+
+```{r Cell type Marker Heatmap, fig.height=24, fig.width=25, eval = T}
+celltype_mar <- read.csv("Celltype-genemarkers.csv")
+
+celltype_mar %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC) -> top5LR
+
+Idents(singledata) <- singledata$CombinedRef
+
+DoHeatmap(object = singledata, features = as.character(top5LR$gene), label=T, size =5) +
+  theme(legend.key.size = unit(.75,"inches"),
+        legend.title = element_text(size=15),
+        legend.text = element_text(size=15),
+        axis.text.y=element_text(size=15), 
+        strip.text.y=element_text(angle=0, vjust=0.5, hjust=0.5, size=15)) 
+```
+
+## Dotplot of Cell types' Top 10 Markers
+
+```{r Cell type Marker dotplot}
+
+celltype_mar <- read.csv("Celltype-genemarkers.csv")
+
+celltype_mar %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC) -> celltop10
+
+for (ident in unique(celltop10$cluster)) {
+
+  celltype <- subset(celltop10,celltop10$cluster == ident)
+  features <- celltype$gene
+ Idents(singledata) <- singledata$CombinedRef
+ print(DotPlot(singledata,features = features) + RotatedAxis() + labs(title = ident))
+  
+}
+
+```
+
+## Cell type vs. Samples
+
+```{r Cell type vs. Samples}
+
+for (ident in unique(singledata$orig.ident)) {
+  
+  sample <- subset(singledata, cells = 
+              rownames(singledata@meta.data[singledata@meta.data$orig.ident
+                                                  %in% ident, ]))
+  x <- as.data.frame(table(sample$CombinedRef))
+  colnames(x) <- c("celltype","Frequency")
+  
+  data <- as.data.frame(x$Frequency)
+  colnames(data) <- c("n")
+  data <- data %>% dplyr::mutate(perc = paste0(sprintf("%4.1f", n / sum(n) * 100), "%"))
+  
+  print(ggplot(data, aes(x = n, y = x$celltype)) +
+          geom_col(fill = "orange") +
+          geom_text(aes(label = perc)) +
+          theme_minimal() +
+          xlab("Number of cells") + ylab("Cell type") + labs(title = ident))
+}
+
+```
+
