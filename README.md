@@ -12,20 +12,20 @@ This repository contains scripts and documentation associated with the analyses 
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 ## Table of Contents
 
-- [Doublets detection](#Doublets detection)
-- [Setup Seurat Object](#Setup Seurat Object)
-- [Quality control](#Qualtiy Control)
-- [Normalizing the data](#Normalization)
-- [Identify variable features](#Identify variale features)
-- [Scaling the data](#Scaling the data)
-- [Dimentionality reduction](#Dimentionality reduction)
-- [Batch correction](#Batch correction)
-- [Cluster the cells](#Cluster the cells)
-- [Run non-linear dimensional reduction UMAP/tSNE](#Run non-linear dimensional reduction UMAP/tSNE)
-- [Celltype identification](#Celltype identification)
-- [Finding differentially expressed features](#Finding differentially expressed features)
-- [Pathway analysis](#Pathway analysis)
-- [Scripts](#Scripts)
+- Doublets detection
+- Setup Seurat Object
+- Quality control
+- Normalizing the data
+- Identify variable features
+- Scaling the data
+- Dimentionality reduction
+- Batch correction
+- Cluster the cells
+- Run non-linear dimensional reduction UMAP/tSNE
+- Celltype identification
+- Finding differentially expressed features
+- Pathway analysis
+- Scripts
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
